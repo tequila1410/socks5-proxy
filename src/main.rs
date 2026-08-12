@@ -1,0 +1,13 @@
+mod runtime;
+mod config;
+mod ingress;
+
+use config::Config;
+
+#[tokio::main]
+async fn main() {
+    dotenvy::dotenv().ok();
+    
+    let config = Config::new();
+    runtime::run(config.socks5_addr()).await;
+}
