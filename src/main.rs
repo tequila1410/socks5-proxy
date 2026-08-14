@@ -1,6 +1,7 @@
 mod runtime;
 mod config;
 mod ingress;
+mod tunnel;
 
 use config::Config;
 

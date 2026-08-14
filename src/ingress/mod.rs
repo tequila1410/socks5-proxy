@@ -1,19 +1,37 @@
 use std::io::{Error, ErrorKind};
 
-use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use crate::tunnel;
 
 pub struct Target {
     pub host: String,
     pub port: u16,
 }
 
-pub async fn handle_connection(stream: &mut TcpStream) -> Result<(), Error> {
-    socks5_negotiate_no_auth(stream).await?;
-    let target = socks5_read_request(stream).await?;
-    // socks5_reply(stream, 0x00).await?;
-    println!("Target host: {}, port: {}", target.host, target.port);
-    Ok(())
+pub async fn handle_connection(mut client_stream: TcpStream) -> Result<(), Error> {
+    socks5_negotiate_no_auth(&mut client_stream).await?;
+    let target = socks5_read_request(&mut client_stream).await?;
+
+    let mut target_stream = match TcpStream::connect((target.host.as_str(), target.port)).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            socks5_reply(&mut client_stream, socks_rep_for_dial_error(&e)).await?;
+            return Err(e);
+        }
+    };
+
+    socks5_reply(&mut client_stream, 0x00).await?;
+    tunnel::copy_bidirectional_tcp(&mut client_stream, &mut target_stream).await
+}
+
+fn socks_rep_for_dial_error(err: &Error) -> u8 {
+    match err.kind() {
+        ErrorKind::ConnectionRefused => 0x05,
+        ErrorKind::TimedOut | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => 0x04,
+        _ => 0x01,
+    }
 }
 
 async fn socks5_negotiate_no_auth(stream: &mut TcpStream) -> Result<(), Error> {
