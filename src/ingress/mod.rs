@@ -1,4 +1,5 @@
 use std::io::{Error, ErrorKind};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -10,26 +11,37 @@ pub struct Target {
     pub port: u16,
 }
 
-pub async fn handle_connection(mut client_stream: TcpStream) -> Result<(), Error> {
+pub async fn handle_connection(mut client_stream: TcpStream, connect_timeout: Duration, idle_timeout: Duration) -> Result<(), Error> {
     socks5_negotiate_no_auth(&mut client_stream).await?;
     let target = socks5_read_request(&mut client_stream).await?;
 
-    let mut target_stream = match TcpStream::connect((target.host.as_str(), target.port)).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            socks5_reply(&mut client_stream, socks_rep_for_dial_error(&e)).await?;
-            return Err(e);
+    let mut target_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect((target.host.as_str(), target.port))).await {
+        Ok(stream_result) => {
+            match stream_result {
+                Ok(stream) => stream,
+                Err(e) => {
+                    socks5_reply(&mut client_stream, socks_rep_for_dial_error(&e)).await?;
+                    return Err(e);
+                }
+            }
+        },
+        Err(_) => {
+            let err = Error::new(ErrorKind::TimedOut, "Timeout");
+            socks5_reply(&mut client_stream, socks_rep_for_dial_error(&err)).await?;
+            return Err(err);
         }
     };
 
+
     socks5_reply(&mut client_stream, 0x00).await?;
-    tunnel::copy_bidirectional_tcp(&mut client_stream, &mut target_stream).await
+    tunnel::copy_bidirectional_tcp(&mut client_stream, &mut target_stream, idle_timeout).await
 }
 
 fn socks_rep_for_dial_error(err: &Error) -> u8 {
     match err.kind() {
         ErrorKind::ConnectionRefused => 0x05,
-        ErrorKind::TimedOut | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => 0x04,
+        ErrorKind::TimedOut | ErrorKind::HostUnreachable => 0x04,
+        ErrorKind::NetworkUnreachable => 0x03,
         _ => 0x01,
     }
 }
