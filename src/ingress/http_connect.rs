@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::ingress::Target;
+use crate::tunnel;
 
 const MAX_HEADERS_BYTES: usize = 8 * 1024;
 
@@ -31,8 +32,8 @@ impl ParseError {
 
 pub async fn handle_http_connection(
     mut client_stream: TcpStream,
-    _connect_timeout: Duration,
-    _idle_timeout: Duration,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
 ) -> Result<(), Error> {
     let headers = match read_headers(&mut client_stream).await {
         Ok(headers) => headers,
@@ -55,8 +56,25 @@ pub async fn handle_http_connection(
         }
     };
 
-    println!("CONNECT {}:{}", target.host, target.port);
-    Ok(())
+    let mut target_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect((target.host.as_str(), target.port))).await {
+        Ok(stream_result) => {
+            match stream_result {
+                Ok(stream) => {
+                    http_reply(&mut client_stream, 200).await?;
+                    stream
+                },
+                Err(e) => {
+                    http_reply(&mut client_stream, 500).await?;
+                    return Err(e);
+                }
+            }
+        },
+        Err(_) => {
+            http_reply(&mut client_stream, 500).await?;
+            return Err(Error::new(ErrorKind::TimedOut, "timeout"));
+        }
+    };
+    tunnel::copy_bidirectional_tcp(&mut client_stream, &mut target_stream, idle_timeout).await
 }
 
 async fn read_headers(stream: &mut TcpStream) -> Result<Vec<u8>, ReadHeadersError> {
@@ -120,6 +138,11 @@ fn parse_connect(headers: &[u8]) -> Result<Target, ParseError> {
 }
 
 async fn http_reply(stream: &mut TcpStream, status: u16) -> Result<(), Error> {
+    if status == 200 {
+        let response = format!("HTTP/1.1 {status} \r\n\r\n");
+        return stream.write_all(response.as_bytes()).await;
+    }
+
     let reason = match status {
         400 => "Bad Request",
         405 => "Method Not Allowed",
