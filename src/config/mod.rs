@@ -6,6 +6,7 @@ pub struct Config {
     pub http_connect_port: u16,
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
+    pub connections_limit: usize,
 }
 
 impl Config {
@@ -13,13 +14,15 @@ impl Config {
         let proxy_host = std::env::var("PROXY_HOST").expect("PROXY_HOST is not set");
         let socks5_port = std::env::var("SOCKS5_PORT").expect("SOCKS5_PORT is not set").parse::<u16>().expect("SOCKS5_PORT is not a valid port");
         let http_connect_port = std::env::var("HTTP_CONNECT_PORT").expect("HTTP_CONNECT_PORT is not set").parse::<u16>().expect("HTTP_CONNECT_PORT is not a valid port");
+        let connections_limit = std::env::var("CONNECTIONS_LIMIT").expect("CONNECTIONS_LIMIT is not set").parse::<usize>().expect("CONNECTIONS_LIMIT is not a valid number");
         
         Self {
             proxy_host,
             socks5_port,
             http_connect_port,
             connect_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),  
+            connections_limit,
         }
     }
 
