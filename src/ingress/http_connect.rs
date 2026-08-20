@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::ingress::Target;
+use crate::ingress::{connect_with_timeout, Target};
 use crate::tunnel;
 
 const MAX_HEADERS_BYTES: usize = 8 * 1024;
@@ -56,25 +56,25 @@ pub async fn handle_http_connection(
         }
     };
 
-    let mut target_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect((target.host.as_str(), target.port))).await {
-        Ok(stream_result) => {
-            match stream_result {
-                Ok(stream) => {
-                    http_reply(&mut client_stream, 200).await?;
-                    stream
-                },
-                Err(e) => {
-                    http_reply(&mut client_stream, 500).await?;
-                    return Err(e);
-                }
-            }
-        },
-        Err(_) => {
-            http_reply(&mut client_stream, 500).await?;
-            return Err(Error::new(ErrorKind::TimedOut, "timeout"));
+    let mut target_stream = match connect_with_timeout(&target, connect_timeout).await {
+        Ok(stream) => {
+            http_reply(&mut client_stream, 200).await?;
+            stream
+        }
+        Err(e) => {
+            http_reply(&mut client_stream, http_status_for_dial_error(&e)).await?;
+            return Err(e);
         }
     };
     tunnel::copy_bidirectional_tcp(&mut client_stream, &mut target_stream, idle_timeout).await
+}
+
+fn http_status_for_dial_error(err: &Error) -> u16 {
+    match err.kind() {
+        ErrorKind::ConnectionRefused | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => 502,
+        ErrorKind::TimedOut => 504,
+        _ => 500,
+    }
 }
 
 async fn read_headers(stream: &mut TcpStream) -> Result<Vec<u8>, ReadHeadersError> {
@@ -147,6 +147,9 @@ async fn http_reply(stream: &mut TcpStream, status: u16) -> Result<(), Error> {
         400 => "Bad Request",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        504 => "Gateway Timeout",
         _ => "Error",
     };
     let response = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -196,5 +199,20 @@ mod tests {
         let raw = b"CONNECT example.com:80 HTTP/1.0";
         let target = parse_connect(raw).unwrap();
         assert_eq!(target.port, 80);
+    }
+
+    #[test]
+    fn maps_dial_errors_to_connect_status() {
+        let cases = [
+            (ErrorKind::ConnectionRefused, 502),
+            (ErrorKind::HostUnreachable, 502),
+            (ErrorKind::NetworkUnreachable, 502),
+            (ErrorKind::TimedOut, 504),
+            (ErrorKind::Other, 500),
+        ];
+        for (kind, status) in cases {
+            let err = Error::new(kind, "test");
+            assert_eq!(http_status_for_dial_error(&err), status, "{kind:?}");
+        }
     }
 }

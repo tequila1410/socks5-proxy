@@ -4,30 +4,20 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::ingress::Target;
+use crate::ingress::{connect_with_timeout, Target};
 use crate::tunnel;
 
 pub async fn handle_socks5_connection(mut client_stream: TcpStream, connect_timeout: Duration, idle_timeout: Duration) -> Result<(), Error> {
     socks5_negotiate_no_auth(&mut client_stream).await?;
     let target = socks5_read_request(&mut client_stream).await?;
 
-    let mut target_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect((target.host.as_str(), target.port))).await {
-        Ok(stream_result) => {
-            match stream_result {
-                Ok(stream) => stream,
-                Err(e) => {
-                    socks5_reply(&mut client_stream, socks_rep_for_dial_error(&e)).await?;
-                    return Err(e);
-                }
-            }
-        },
-        Err(_) => {
-            let err = Error::new(ErrorKind::TimedOut, "Timeout");
-            socks5_reply(&mut client_stream, socks_rep_for_dial_error(&err)).await?;
-            return Err(err);
+    let mut target_stream = match connect_with_timeout(&target, connect_timeout).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            socks5_reply(&mut client_stream, socks_rep_for_dial_error(&e)).await?;
+            return Err(e);
         }
     };
-
 
     socks5_reply(&mut client_stream, 0x00).await?;
     tunnel::copy_bidirectional_tcp(&mut client_stream, &mut target_stream, idle_timeout).await
