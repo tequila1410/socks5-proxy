@@ -1,11 +1,15 @@
 use std::future::Future;
 use std::io::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tracing::Instrument;
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::config::Config;
 use crate::ingress::http_connect::handle_http_connection;
@@ -25,7 +29,7 @@ pub async fn run(config: Config) {
             Arc::clone(&join_set),
             handle_http_connection,
         ) => {
-            println!("HTTP CONNECT listener exited, shutting down...");
+            tracing::info!("HTTP CONNECT listener exited, shutting down");
         }
         _ = accept_loop(
             config.socks5_addr(),
@@ -34,12 +38,12 @@ pub async fn run(config: Config) {
             Arc::clone(&join_set),
             handle_socks5_connection,
         ) => {
-            println!("SOCKS5 listener exited, shutting down...");
+            tracing::info!("SOCKS5 listener exited, shutting down");
         }
         result = tokio::signal::ctrl_c() => {
             match result {
-                Ok(()) => println!("Ctrl+C received, shutting down..."),
-                Err(e) => println!("Error listening for Ctrl+C: {}", e),
+                Ok(()) => tracing::info!("Ctrl+C received, shutting down"),
+                Err(e) => tracing::error!(error = %e, "error listening for Ctrl+C"),
             }
         }
     }
@@ -63,14 +67,14 @@ async fn drain_join_set(mut join_set: JoinSet<()>) {
     loop {
         tokio::select! {
             _ = &mut drain_deadline => {
-                println!("Drain timeout, aborting remaining connections...");
+                tracing::warn!("drain timeout, aborting remaining connections");
                 abort_remaining(&mut join_set).await;
                 return;
             }
             result = tokio::signal::ctrl_c() => {
                 match result {
-                    Ok(()) => println!("Second Ctrl+C, aborting remaining connections..."),
-                    Err(e) => println!("Error listening for Ctrl+C: {}", e),
+                    Ok(()) => tracing::info!("second Ctrl+C, aborting remaining connections"),
+                    Err(e) => tracing::error!(error = %e, "error listening for Ctrl+C"),
                 }
                 abort_remaining(&mut join_set).await;
                 return;
@@ -79,7 +83,7 @@ async fn drain_join_set(mut join_set: JoinSet<()>) {
                 match joined {
                     None => return,
                     Some(Ok(())) => {}
-                    Some(Err(e)) => println!("Connection task ended: {}", e),
+                    Some(Err(e)) => tracing::error!(error = %e, "connection task ended"),
                 }
             }
         }
@@ -102,6 +106,7 @@ async fn accept_loop<F, Fut>(
     Fut: Future<Output = Result<(), Error>> + Send,
 {
     let listener = TcpListener::bind(&addr).await.unwrap();
+    tracing::info!(%addr, "listening");
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -110,22 +115,26 @@ async fn accept_loop<F, Fut>(
                 let permit = match semaphore.try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(e) => {
-                        println!("Error acquiring permit: {}", e);
+                        tracing::warn!(error = %e, "connection limit reached, dropping");
                         continue;
                     }
                 };
+                let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
                 let mut join_set_lock = join_set.lock().expect("Failed to lock join set");
-                join_set_lock.spawn(async move {
-                    let _permit = permit;
-                    if let Err(e) =
-                        handler(stream, config.connect_timeout, config.idle_timeout).await
-                    {
-                        println!("Error: {}", e);
+                join_set_lock.spawn(
+                    async move {
+                        let _permit = permit;
+                        if let Err(e) =
+                            handler(stream, config.connect_timeout, config.idle_timeout).await
+                        {
+                            tracing::error!(error = %e, "connection handler failed");
+                        }
                     }
-                });
+                    .instrument(tracing::info_span!("conn", conn_id)),
+                );
             }
             Err(e) => {
-                println!("Error: {}", e);
+                tracing::error!(error = %e, "accept failed");
             }
         }
     }
